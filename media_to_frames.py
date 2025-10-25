@@ -1,4 +1,11 @@
-"""Convert local GIF and MP4 media into frame sequences suitable for ESP displays.
+#   _____   _____      /\     __     __
+#  / ____| |  __ \    /  \    \ \   / /
+# | |      | |__) |  / /\ \    \ \_/ / 
+# | |      |  _  /  / ____ \    \   /  
+# | |____  | | \ \ /_/    \_\    | |   
+#  \_____| |_|  \_\              |_|   
+"""
+Convert local GIF and MP4 media into frame sequences suitable for ESP displays.
 
 Place .gif files in input_gifs/, .mp4 files in input_mp4s/, run the script,
 and review the generated folders under output_frames/.
@@ -11,6 +18,7 @@ import json
 import logging
 import shutil
 from dataclasses import dataclass, replace
+import re
 from pathlib import Path
 from typing import Iterable, Iterator, List, Tuple
 
@@ -66,6 +74,8 @@ def _build_rgb332_palette() -> List[int]:
 
 RGB332_PALETTE_IMAGE = Image.new("P", (1, 1))
 RGB332_PALETTE_IMAGE.putpalette(_build_rgb332_palette())
+
+TIMING_LINE_PATTERN = re.compile(r"^frame_\d{4}\.(bmp|jpg|jpeg)\s+\d+ms(?:\s{2,}#.*)?$")
 
 
 @dataclass
@@ -139,6 +149,37 @@ def quantize_frame(frame: Image.Image, output_size: Tuple[int, int], color_depth
     resized = frame.resize(output_size, RESAMPLE_FILTER)
     rgb = resized.convert("RGB")
     return quantize_for_bmp(rgb, color_depth)
+
+
+def write_timing_file(frame_dir: Path, frame_names: List[str], delays_ms: List[int]) -> None:
+    if len(frame_names) != len(delays_ms):
+        raise ValueError(
+            f"Frame name count ({len(frame_names)}) does not match delay count ({len(delays_ms)})."
+        )
+
+    timing_path = frame_dir / "timing.txt"
+    tmp_path = frame_dir / "timing.txt.tmp"
+
+    lines = []
+    for fname, delay in zip(frame_names, delays_ms):
+        delay_int = int(float(delay))
+        lines.append(f"{fname}\t{delay_int}ms\n")
+
+    with tmp_path.open("w", encoding="utf-8", newline="\n") as fh:
+        fh.writelines(lines)
+    tmp_path.replace(timing_path)
+    print(f"Wrote timing.txt ({len(lines)} entries)")
+
+
+def write_legacy_frames_file(frame_dir: Path, delays_ms: List[int]) -> None:
+    frames_txt = frame_dir / "frames.txt"
+    if frames_txt.exists():
+        print(f"Skipping legacy frames.txt (already exists at {frames_txt})")
+        return
+    tmp_path = frame_dir / "frames.txt.tmp"
+    with tmp_path.open("w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(str(int(float(delay))) for delay in delays_ms))
+    tmp_path.replace(frames_txt)
 
 
 def bytes_per_frame(width: int, height: int, pixel_format: str) -> int:
@@ -278,6 +319,7 @@ def save_frames_from_gif(
     output_size: Tuple[int, int],
     color_depth: int,
     binary_options: BinaryOptions,
+    legacy_frames: bool,
     output_name: str | None = None,
 ) -> bool:
     """Extract frames from a GIF file, save BMP frames, and optionally emit binaries."""
@@ -286,6 +328,7 @@ def save_frames_from_gif(
     frame_dir.mkdir(parents=True, exist_ok=True)
 
     delays: List[int] = []
+    frame_names: List[str] = []
     binary_writer = BinaryFrameWriter(frame_dir, binary_options, output_size[0], output_size[1]) if binary_options.enabled else None
 
     try:
@@ -299,6 +342,7 @@ def save_frames_from_gif(
                 bmp_frame.save(frame_path, format="BMP")
 
                 delays.append(int(delay_ms))
+                frame_names.append(frame_path.name)
                 if binary_writer:
                     binary_writer.add_frame(rgb_frame, index)
 
@@ -322,8 +366,9 @@ def save_frames_from_gif(
         shutil.rmtree(frame_dir, ignore_errors=True)
         return False
 
-    frames_txt = frame_dir / "frames.txt"
-    frames_txt.write_text("\n".join(str(delay) for delay in delays), encoding="utf-8")
+    write_timing_file(frame_dir, frame_names, delays)
+    if legacy_frames:
+        write_legacy_frames_file(frame_dir, delays)
 
     if binary_writer:
         binary_writer.finalize(delays)
@@ -374,6 +419,7 @@ def process_mp4(
     fps: int,
     cleanup_temp: bool,
     binary_options: BinaryOptions,
+    legacy_frames: bool,
 ) -> bool:
     """Convert an MP4 to GIF and then extract frames using the GIF workflow."""
     temp_gif = convert_mp4_to_gif(mp4_path, output_size, fps)
@@ -388,6 +434,7 @@ def process_mp4(
             output_size,
             color_depth,
             binary_options,
+            legacy_frames,
             output_name=mp4_path.stem,
         )
     finally:
@@ -443,6 +490,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit a single frames.bin file plus metadata instead of per-frame binaries.",
     )
+    parser.add_argument(
+        "--emit-legacy-frames-file",
+        action="store_true",
+        help="Also write the legacy frames.txt delays file alongside timing.txt.",
+    )
     return parser
 
 
@@ -452,6 +504,7 @@ def process_media(
     fps: int,
     cleanup_temp: bool,
     binary_options: BinaryOptions,
+    legacy_frames: bool,
 ) -> Tuple[int, int, int, int]:
     """Process all media found in the input directories."""
     ensure_directories()
@@ -475,12 +528,12 @@ def process_media(
     converted_gifs = 0
     for gif_path in gifs:
         print(f"Processing {gif_path.name}...")
-        if save_frames_from_gif(gif_path, OUTPUT_PATH, output_size, color_depth, binary_options):
+        if save_frames_from_gif(gif_path, OUTPUT_PATH, output_size, color_depth, binary_options, legacy_frames):
             converted_gifs += 1
 
     converted_videos = 0
     for mp4_path in videos:
-        if process_mp4(mp4_path, OUTPUT_PATH, output_size, color_depth, fps, cleanup_temp, binary_options):
+        if process_mp4(mp4_path, OUTPUT_PATH, output_size, color_depth, fps, cleanup_temp, binary_options, legacy_frames):
             converted_videos += 1
 
     print(
@@ -552,6 +605,7 @@ def run_gif_test(
     fps: int,
     no_cleanup: bool,
     binary_options: BinaryOptions,
+    legacy_frames: bool,
 ) -> None:
     test_gif = Path(TEST_GIF_NAME)
     if not test_gif.exists():
@@ -570,28 +624,42 @@ def run_gif_test(
     shutil.copy2(test_gif, destination)
 
     cleanup_temp = not no_cleanup
-    process_media(output_size, color_depth, fps, cleanup_temp, binary_options)
+    process_media(output_size, color_depth, fps, cleanup_temp, binary_options, legacy_frames)
 
     frame_file = frames_dir / "frame_0001.bmp"
-    frames_txt = frames_dir / "frames.txt"
+    timing_file = frames_dir / "timing.txt"
 
     if not frames_dir.exists():
         print("Test case failed: output folder was not created.")
     elif not frame_file.exists():
         print("Test case failed: first frame file is missing.")
-    elif not frames_txt.exists():
-        print("Test case failed: frames.txt not generated.")
+    elif not timing_file.exists():
+        print("Test case failed: timing.txt not generated.")
     else:
-        delays = [line for line in frames_txt.read_text(encoding="utf-8").splitlines() if line.strip()]
-        if not delays:
-            print("Test case failed: frames.txt does not contain delay entries.")
+        timing_lines = [line for line in timing_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+        frame_count = len(list(frames_dir.glob("frame_*.bmp")))
+        if len(timing_lines) != frame_count:
+            print("Test case failed: timing.txt line count does not match frame count.")
+        elif not all(TIMING_LINE_PATTERN.match(line) for line in timing_lines):
+            print("Test case failed: timing.txt contains malformed lines.")
         else:
-            if binary_options.enabled:
-                validate_binary_output(frames_dir, binary_options)
-            frame_count = len(list(frames_dir.glob("frame_*.bmp")))
-            print(
-                f"Test case passed: {TEST_GIF_NAME} converted successfully with {frame_count} frame(s)."
-            )
+            success = True
+            if legacy_frames:
+                frames_txt = frames_dir / "frames.txt"
+                if not frames_txt.exists():
+                    print("Test case failed: legacy frames.txt requested but missing.")
+                    success = False
+                else:
+                    legacy_lines = [line for line in frames_txt.read_text(encoding="utf-8").splitlines() if line.strip()]
+                    if len(legacy_lines) != frame_count:
+                        print("Test case failed: frames.txt entries do not match frame count.")
+                        success = False
+            if success:
+                if binary_options.enabled:
+                    validate_binary_output(frames_dir, binary_options)
+                print(
+                    f"Test case passed: {TEST_GIF_NAME} converted successfully with {frame_count} frame(s)."
+                )
 
     if not no_cleanup:
         if frames_dir.exists():
@@ -606,6 +674,7 @@ def run_mp4_test(
     fps: int,
     no_cleanup: bool,
     binary_options: BinaryOptions,
+    legacy_frames: bool,
 ) -> None:
     test_mp4 = Path(TEST_MP4_NAME)
     if not test_mp4.exists():
@@ -624,28 +693,42 @@ def run_mp4_test(
     shutil.copy2(test_mp4, destination)
 
     cleanup_temp = not no_cleanup
-    process_media(output_size, color_depth, fps, cleanup_temp, binary_options)
+    process_media(output_size, color_depth, fps, cleanup_temp, binary_options, legacy_frames)
 
     frame_file = frames_dir / "frame_0001.bmp"
-    frames_txt = frames_dir / "frames.txt"
+    timing_file = frames_dir / "timing.txt"
 
     if not frames_dir.exists():
         print("MP4 test case failed: output folder was not created.")
     elif not frame_file.exists():
         print("MP4 test case failed: first frame file is missing.")
-    elif not frames_txt.exists():
-        print("MP4 test case failed: frames.txt not generated.")
+    elif not timing_file.exists():
+        print("MP4 test case failed: timing.txt not generated.")
     else:
-        delays = [line for line in frames_txt.read_text(encoding="utf-8").splitlines() if line.strip()]
-        if not delays:
-            print("MP4 test case failed: frames.txt does not contain delay entries.")
+        timing_lines = [line for line in timing_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+        frame_count = len(list(frames_dir.glob("frame_*.bmp")))
+        if len(timing_lines) != frame_count:
+            print("MP4 test case failed: timing.txt line count does not match frame count.")
+        elif not all(TIMING_LINE_PATTERN.match(line) for line in timing_lines):
+            print("MP4 test case failed: timing.txt contains malformed lines.")
         else:
-            if binary_options.enabled:
-                validate_binary_output(frames_dir, binary_options)
-            frame_count = len(list(frames_dir.glob("frame_*.bmp")))
-            print(
-                f"MP4 test case passed: {TEST_MP4_NAME} converted successfully with {frame_count} frame(s)."
-            )
+            success = True
+            if legacy_frames:
+                frames_txt = frames_dir / "frames.txt"
+                if not frames_txt.exists():
+                    print("MP4 test case failed: legacy frames.txt requested but missing.")
+                    success = False
+                else:
+                    legacy_lines = [line for line in frames_txt.read_text(encoding="utf-8").splitlines() if line.strip()]
+                    if len(legacy_lines) != frame_count:
+                        print("MP4 test case failed: frames.txt entries do not match frame count.")
+                        success = False
+            if success:
+                if binary_options.enabled:
+                    validate_binary_output(frames_dir, binary_options)
+                print(
+                    f"MP4 test case passed: {TEST_MP4_NAME} converted successfully with {frame_count} frame(s)."
+                )
 
     if not no_cleanup:
         if frames_dir.exists():
@@ -660,13 +743,14 @@ def run_built_in_tests(
     fps: int,
     no_cleanup: bool,
     binary_options: BinaryOptions,
+    legacy_frames: bool,
 ) -> None:
-    run_gif_test(output_size, color_depth, fps, no_cleanup, binary_options)
-    run_mp4_test(output_size, color_depth, fps, no_cleanup, binary_options)
+    run_gif_test(output_size, color_depth, fps, no_cleanup, binary_options, legacy_frames)
+    run_mp4_test(output_size, color_depth, fps, no_cleanup, binary_options, legacy_frames)
 
     if binary_options.enabled:
         mono_options = binary_options.with_overrides(pixel_format="mono1", dither="ordered", bin_subdir="bin_mono1")
-        run_gif_test(output_size, color_depth, fps, no_cleanup, mono_options)
+        run_gif_test(output_size, color_depth, fps, no_cleanup, mono_options, legacy_frames)
         print("Binary pipeline test passed: mono1 format validated.")
 
 
@@ -681,6 +765,7 @@ def main() -> int:
     fps = max(1, GIF_FPS)
 
     cleanup_temp = not args.no_cleanup
+    legacy_frames = args.emit_legacy_frames_file
 
     binary_options = BinaryOptions(
         enabled=args.emit_binary,
@@ -691,12 +776,12 @@ def main() -> int:
         single_file=args.bin_onefile,
     )
 
-    process_media(output_size, color_depth, fps, cleanup_temp, binary_options)
+    process_media(output_size, color_depth, fps, cleanup_temp, binary_options, legacy_frames)
 
     if cleanup_temp:
         clean_temp_directory()
 
-    run_built_in_tests(output_size, color_depth, fps, args.no_cleanup, binary_options)
+    run_built_in_tests(output_size, color_depth, fps, args.no_cleanup, binary_options, legacy_frames)
 
     return 0
 
