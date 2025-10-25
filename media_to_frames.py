@@ -12,7 +12,10 @@ import shutil
 from pathlib import Path
 from typing import Iterable, Tuple
 
-from moviepy.editor import VideoFileClip
+try:  # MoviePy >= 2.2.1 exposes VideoFileClip at package top-level.
+    from moviepy import VideoFileClip
+except ImportError:  # Older releases keep it under moviepy.editor.
+    from moviepy.editor import VideoFileClip  # type: ignore[attr-defined]
 from PIL import Image, ImageSequence, UnidentifiedImageError
 
 OUTPUT_SIZE = (128, 128)
