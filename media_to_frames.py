@@ -1,4 +1,11 @@
-"""Convert local GIF and MP4 media into frame sequences suitable for ESP displays.
+#   _____   _____      /\     __     __
+#  / ____| |  __ \    /  \    \ \   / /
+# | |      | |__) |  / /\ \    \ \_/ / 
+# | |      |  _  /  / ____ \    \   /  
+# | |____  | | \ \ /_/    \_\    | |   
+#  \_____| |_|  \_\              |_|   
+"""
+Convert local GIF and MP4 media into frame sequences suitable for ESP displays.
 
 Place .gif files in input_gifs/, .mp4 files in input_mp4s/, run the script,
 and review the generated folders under output_frames/.
@@ -7,16 +14,20 @@ and review the generated folders under output_frames/.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import shutil
+from dataclasses import dataclass, replace
+import re
 from pathlib import Path
-from typing import Iterable, Tuple
+from typing import Iterable, Iterator, List, Tuple
 
-try:  # MoviePy >= 2.2.1 exposes VideoFileClip at package top-level.
+try:  # MoviePy >= 2.2.1 exposes VideoFileClip at the package top level.
     from moviepy import VideoFileClip
 except ImportError:  # Older releases keep it under moviepy.editor.
     from moviepy.editor import VideoFileClip  # type: ignore[attr-defined]
-from PIL import Image, ImageSequence, UnidentifiedImageError
+
+from PIL import Image, UnidentifiedImageError
 
 OUTPUT_SIZE = (128, 128)
 COLOR_DEPTH = 256
@@ -41,6 +52,44 @@ except AttributeError:
 
 if not hasattr(Image, "ANTIALIAS"):
     Image.ANTIALIAS = RESAMPLE_FILTER
+
+PIL_DITHER = {
+    "none": Image.Dither.NONE,
+    "floyd": Image.Dither.FLOYDSTEINBERG,
+    "ordered": Image.Dither.ORDERED,
+}
+
+
+def _build_rgb332_palette() -> List[int]:
+    palette: List[int] = []
+    for r in range(8):
+        rr = int(round(r * 255 / 7))
+        for g in range(8):
+            gg = int(round(g * 255 / 7))
+            for b in range(4):
+                bb = int(round(b * 255 / 3))
+                palette.extend([rr, gg, bb])
+    return palette
+
+
+RGB332_PALETTE_IMAGE = Image.new("P", (1, 1))
+RGB332_PALETTE_IMAGE.putpalette(_build_rgb332_palette())
+
+TIMING_LINE_PATTERN = re.compile(r"^frame_\d{4}\.(bmp|jpg|jpeg)\s+\d+ms(?:\s{2,}#.*)?$")
+
+
+@dataclass
+class BinaryOptions:
+    enabled: bool = False
+    pixel_format: str = "rgb565"
+    endian: str = "little"
+    dither: str = "none"
+    pack_order: str = "row-major"
+    single_file: bool = False
+    bin_subdir: str = "bin"
+
+    def with_overrides(self, **kwargs: object) -> "BinaryOptions":
+        return replace(self, **kwargs)
 
 
 def parse_size(value: str) -> Tuple[int, int]:
@@ -70,12 +119,261 @@ def iter_media(directory: Path, suffix: str) -> Iterable[Path]:
     return sorted(p for p in directory.iterdir() if p.is_file() and p.suffix.lower() == suffix.lower())
 
 
+def composite_gif_frames(im: Image.Image) -> Iterator[Tuple[Image.Image, int]]:
+    """Yield fully composited RGBA frames and their delays from an animated GIF."""
+    try:
+        im.seek(0)
+    except EOFError:
+        return
+
+    while True:
+        duration = int(im.info.get("duration", 0) or 0)
+        frame = im.copy().convert("RGBA")
+        base = Image.new("RGBA", im.size, (0, 0, 0, 255))
+        base.alpha_composite(frame)
+        yield base, duration
+        try:
+            im.seek(im.tell() + 1)
+        except EOFError:
+            break
+
+
+def quantize_for_bmp(rgb_image: Image.Image, color_depth: int) -> Image.Image:
+    """Quantize an RGB image for BMP output."""
+    colors = max(1, min(color_depth, 256))
+    return rgb_image.quantize(colors=colors, method=Image.MEDIANCUT)
+
+
 def quantize_frame(frame: Image.Image, output_size: Tuple[int, int], color_depth: int) -> Image.Image:
-    """Resize and quantize a single frame."""
-    processed = frame.copy().convert("RGBA")
-    processed = processed.resize(output_size, RESAMPLE_FILTER)
-    processed = processed.convert("RGB")
-    return processed.quantize(colors=color_depth, method=Image.MEDIANCUT)
+    """Resize and quantize a single frame for BMP output."""
+    resized = frame.resize(output_size, RESAMPLE_FILTER)
+    rgb = resized.convert("RGB")
+    return quantize_for_bmp(rgb, color_depth)
+
+
+def write_timing_file(frame_dir: Path, frame_names: List[str], delays_ms: List[int]) -> None:
+    if len(frame_names) != len(delays_ms):
+        raise ValueError(
+            f"Frame name count ({len(frame_names)}) does not match delay count ({len(delays_ms)})."
+        )
+
+    timing_path = frame_dir / "timing.txt"
+    tmp_path = frame_dir / "timing.txt.tmp"
+
+    lines = []
+    for fname, delay in zip(frame_names, delays_ms):
+        delay_int = int(float(delay))
+        lines.append(f"{fname}\t{delay_int}ms\n")
+
+    with tmp_path.open("w", encoding="utf-8", newline="\n") as fh:
+        fh.writelines(lines)
+    tmp_path.replace(timing_path)
+    print(f"Wrote timing.txt ({len(lines)} entries)")
+
+
+def write_legacy_frames_file(frame_dir: Path, delays_ms: List[int]) -> None:
+    frames_txt = frame_dir / "frames.txt"
+    if frames_txt.exists():
+        print(f"Skipping legacy frames.txt (already exists at {frames_txt})")
+        return
+    tmp_path = frame_dir / "frames.txt.tmp"
+    with tmp_path.open("w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(str(int(float(delay))) for delay in delays_ms))
+    tmp_path.replace(frames_txt)
+
+
+def bytes_per_frame(width: int, height: int, pixel_format: str) -> int:
+    if pixel_format == "rgb565":
+        return width * height * 2
+    if pixel_format == "rgb332":
+        return width * height
+    if pixel_format == "mono1":
+        return ((width + 7) // 8) * height
+    raise ValueError(f"Unsupported pixel format: {pixel_format}")
+
+
+def convert_image_to_buffer(
+    image: Image.Image,
+    options: BinaryOptions,
+    width: int,
+    height: int,
+) -> bytes:
+    """Convert an RGB image to the requested binary framebuffer format."""
+    if options.pixel_format == "rgb565":
+        rgb = image.convert("RGB")
+        data = rgb.tobytes()
+        total_pixels = width * height
+        out = bytearray(total_pixels * 2)
+        little_endian = options.endian == "little"
+        for idx in range(total_pixels):
+            r = data[idx * 3]
+            g = data[idx * 3 + 1]
+            b = data[idx * 3 + 2]
+            value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+            if little_endian:
+                out[idx * 2] = value & 0xFF
+                out[idx * 2 + 1] = (value >> 8) & 0xFF
+            else:
+                out[idx * 2] = (value >> 8) & 0xFF
+                out[idx * 2 + 1] = value & 0xFF
+        return bytes(out)
+
+    if options.pixel_format == "rgb332":
+        rgb = image.convert("RGB")
+        dither_mode = PIL_DITHER[options.dither]
+        paletted = rgb.quantize(palette=RGB332_PALETTE_IMAGE, dither=dither_mode)
+        return paletted.tobytes()
+
+    if options.pixel_format == "mono1":
+        gray = image.convert("L")
+        dither_mode = PIL_DITHER[options.dither]
+        mono = gray.convert("1", dither=dither_mode)
+        return mono.tobytes()
+
+    raise ValueError(f"Unsupported pixel format: {options.pixel_format}")
+
+
+class BinaryFrameWriter:
+    """Handle writing binary frame buffers and metadata."""
+
+    def __init__(self, frame_dir: Path, options: BinaryOptions, width: int, height: int) -> None:
+        self.options = options
+        self.width = width
+        self.height = height
+        self.single_file = options.single_file
+        self.frame_count = 0
+        self.expected_length = bytes_per_frame(width, height, options.pixel_format)
+        self.filenames: List[str] = []
+        self.frame_offsets: List[int] = []
+        self.current_offset = 0
+        self._bin_handle = None
+        self._tmp_bin_path: Path | None = None
+        self.bin_dir = self._prepare_bin_dir(frame_dir, options.bin_subdir)
+
+    @staticmethod
+    def _prepare_bin_dir(frame_dir: Path, subdir: str) -> Path:
+        name = subdir.strip() or "bin"
+        sanitized = Path(name).name  # drop nested components
+        dest = frame_dir / sanitized
+        dest.mkdir(parents=True, exist_ok=True)
+        return dest
+
+    def add_frame(self, image: Image.Image, index: int) -> None:
+        buffer = convert_image_to_buffer(image, self.options, self.width, self.height)
+        if len(buffer) != self.expected_length:
+            raise ValueError(
+                f"Unexpected buffer length {len(buffer)} (expected {self.expected_length}) for frame {index}"
+            )
+
+        if self.single_file:
+            if self._bin_handle is None:
+                self._tmp_bin_path = self.bin_dir / "frames.bin.tmp"
+                self._bin_handle = open(self._tmp_bin_path, "wb")
+            self.frame_offsets.append(self.current_offset)
+            self._bin_handle.write(buffer)
+            self.current_offset += len(buffer)
+            self.filenames = ["frames.bin"]
+        else:
+            filename = f"frame_{index:04d}.bin"
+            tmp_path = self.bin_dir / f"{filename}.tmp"
+            final_path = self.bin_dir / filename
+            with open(tmp_path, "wb") as fh:
+                fh.write(buffer)
+            tmp_path.replace(final_path)
+            self.filenames.append(filename)
+
+        self.frame_count += 1
+
+    def finalize(self, delays: List[int]) -> None:
+        if self.single_file and self._bin_handle and self._tmp_bin_path:
+            self._bin_handle.close()
+            final_path = self.bin_dir / "frames.bin"
+            self._tmp_bin_path.replace(final_path)
+        metadata = {
+            "width": self.width,
+            "height": self.height,
+            "pixel_format": self.options.pixel_format,
+            "endian": self.options.endian,
+            "dither": self.options.dither,
+            "pack_order": self.options.pack_order,
+            "frame_count": self.frame_count,
+            "delays_ms": [int(d) for d in delays],
+            "filenames": self.filenames,
+        }
+        if self.single_file:
+            metadata["frame_offsets"] = self.frame_offsets
+            metadata["frame_length_bytes"] = self.expected_length
+        metadata_path = self.bin_dir / "metadata.json"
+        tmp_metadata = metadata_path.with_suffix(".json.tmp")
+        with open(tmp_metadata, "w", encoding="utf-8") as fh:
+            json.dump(metadata, fh, indent=2)
+        tmp_metadata.replace(metadata_path)
+
+    def abort(self) -> None:
+        shutil.rmtree(self.bin_dir, ignore_errors=True)
+
+
+def save_frames_from_gif(
+    gif_path: Path,
+    output_dir: Path,
+    output_size: Tuple[int, int],
+    color_depth: int,
+    binary_options: BinaryOptions,
+    legacy_frames: bool,
+    output_name: str | None = None,
+) -> bool:
+    """Extract frames from a GIF file, save BMP frames, and optionally emit binaries."""
+    destination_name = output_name or gif_path.stem
+    frame_dir = output_dir / destination_name
+    frame_dir.mkdir(parents=True, exist_ok=True)
+
+    delays: List[int] = []
+    frame_names: List[str] = []
+    binary_writer = BinaryFrameWriter(frame_dir, binary_options, output_size[0], output_size[1]) if binary_options.enabled else None
+
+    try:
+        with Image.open(gif_path) as img:
+            for index, (frame_rgba, delay_ms) in enumerate(composite_gif_frames(img), start=1):
+                resized = frame_rgba.resize(output_size, RESAMPLE_FILTER)
+                rgb_frame = resized.convert("RGB")
+                bmp_frame = quantize_for_bmp(rgb_frame, color_depth)
+
+                frame_path = frame_dir / f"frame_{index:04d}.bmp"
+                bmp_frame.save(frame_path, format="BMP")
+
+                delays.append(int(delay_ms))
+                frame_names.append(frame_path.name)
+                if binary_writer:
+                    binary_writer.add_frame(rgb_frame, index)
+
+    except (UnidentifiedImageError, OSError) as exc:
+        logging.warning("Skipping corrupted GIF '%s': %s", gif_path.name, exc)
+        if binary_writer:
+            binary_writer.abort()
+        shutil.rmtree(frame_dir, ignore_errors=True)
+        return False
+    except Exception as exc:
+        logging.warning("Unexpected error processing '%s': %s", gif_path.name, exc)
+        if binary_writer:
+            binary_writer.abort()
+        shutil.rmtree(frame_dir, ignore_errors=True)
+        return False
+
+    if not delays:
+        logging.warning("No frames extracted from '%s'; removing empty output", gif_path.name)
+        if binary_writer:
+            binary_writer.abort()
+        shutil.rmtree(frame_dir, ignore_errors=True)
+        return False
+
+    write_timing_file(frame_dir, frame_names, delays)
+    if legacy_frames:
+        write_legacy_frames_file(frame_dir, delays)
+
+    if binary_writer:
+        binary_writer.finalize(delays)
+
+    return True
 
 
 def close_clip(clip: object) -> None:
@@ -85,58 +383,6 @@ def close_clip(clip: object) -> None:
         close_fn()
 
 
-def save_frames_from_gif(
-    gif_path: Path,
-    output_dir: Path,
-    output_size: Tuple[int, int],
-    color_depth: int,
-    output_name: str | None = None,
-) -> bool:
-    """Extract frames from a GIF file and save them as BMP images."""
-    destination_name = output_name or gif_path.stem
-    frame_dir = output_dir / destination_name
-    frame_dir.mkdir(parents=True, exist_ok=True)
-
-    delays: list[int] = []
-
-    print(f"Processing {gif_path.name}...")
-
-    try:
-        with Image.open(gif_path) as img:
-            total_frames = getattr(img, "n_frames", 1)
-            print(f"  Detected {total_frames} frame(s)")
-
-            for index, frame in enumerate(ImageSequence.Iterator(img), start=1):
-                delay_ms = frame.info.get("duration", img.info.get("duration", 0)) or 0
-                processed = quantize_frame(frame, output_size, color_depth)
-
-                frame_path = frame_dir / f"frame_{index:04d}.bmp"
-                processed.save(frame_path, format="BMP")
-
-                delays.append(int(delay_ms))
-                print(f"    Saved frame {index:04d}")
-
-    except (UnidentifiedImageError, OSError) as exc:
-        logging.warning("Skipping corrupted GIF '%s': %s", gif_path.name, exc)
-        shutil.rmtree(frame_dir, ignore_errors=True)
-        return False
-    except Exception as exc:
-        logging.warning("Unexpected error processing '%s': %s", gif_path.name, exc)
-        shutil.rmtree(frame_dir, ignore_errors=True)
-        return False
-
-    if not delays:
-        logging.warning("No frames extracted from '%s'; removing empty output", gif_path.name)
-        shutil.rmtree(frame_dir, ignore_errors=True)
-        return False
-
-    frames_txt = frame_dir / "frames.txt"
-    frames_txt.write_text("\n".join(str(delay) for delay in delays), encoding="utf-8")
-    print(f"  Wrote delays to {frames_txt}")
-
-    return True
-
-
 def convert_mp4_to_gif(mp4_path: Path, target_size: Tuple[int, int], fps: int) -> Path | None:
     """Convert an MP4 to a temporary GIF stored under TEMP_GIF_PATH."""
     print(f"Converting video: {mp4_path.name}...")
@@ -144,24 +390,9 @@ def convert_mp4_to_gif(mp4_path: Path, target_size: Tuple[int, int], fps: int) -
     temp_gif_path = TEMP_GIF_PATH / f"{mp4_path.stem}.gif"
 
     clip = None
-    resized = None
-    cropped = None
-
     try:
         clip = VideoFileClip(str(mp4_path))
-        target_w, target_h = target_size
-        if clip.w == 0 or clip.h == 0:
-            raise ValueError("Clip has invalid dimensions and cannot be resized.")
-
-        scale = max(target_w / clip.w, target_h / clip.h)
-        resized = clip.resize(scale)
-        cropped = resized.crop(
-            x_center=resized.w / 2,
-            y_center=resized.h / 2,
-            width=target_w,
-            height=target_h,
-        )
-
+        cropped = clip.resize(target_size)
         cropped.write_gif(
             str(temp_gif_path),
             fps=fps,
@@ -170,16 +401,10 @@ def convert_mp4_to_gif(mp4_path: Path, target_size: Tuple[int, int], fps: int) -
         )
     except Exception as exc:
         logging.warning("Skipping video '%s': %s", mp4_path.name, exc)
-        try:
+        if temp_gif_path.exists():
             temp_gif_path.unlink()
-        except FileNotFoundError:
-            pass
         return None
     finally:
-        if cropped is not None:
-            close_clip(cropped)
-        if resized is not None:
-            close_clip(resized)
         if clip is not None:
             close_clip(clip)
 
@@ -193,6 +418,8 @@ def process_mp4(
     color_depth: int,
     fps: int,
     cleanup_temp: bool,
+    binary_options: BinaryOptions,
+    legacy_frames: bool,
 ) -> bool:
     """Convert an MP4 to GIF and then extract frames using the GIF workflow."""
     temp_gif = convert_mp4_to_gif(mp4_path, output_size, fps)
@@ -201,13 +428,18 @@ def process_mp4(
 
     try:
         print(f"Extracting frames from {mp4_path.name}...")
-        return save_frames_from_gif(temp_gif, output_dir, output_size, color_depth, output_name=mp4_path.stem)
+        return save_frames_from_gif(
+            temp_gif,
+            output_dir,
+            output_size,
+            color_depth,
+            binary_options,
+            legacy_frames,
+            output_name=mp4_path.stem,
+        )
     finally:
-        if cleanup_temp:
-            try:
-                temp_gif.unlink()
-            except FileNotFoundError:
-                pass
+        if cleanup_temp and temp_gif.exists():
+            temp_gif.unlink()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -224,6 +456,45 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Retain temporary GIF files and test outputs for debugging.",
     )
+    parser.add_argument(
+        "--emit-binary",
+        action="store_true",
+        help="Emit binary framebuffer output alongside image frames.",
+    )
+    parser.add_argument(
+        "--binary-format",
+        choices=("rgb565", "rgb332", "mono1"),
+        default="rgb565",
+        help="Binary pixel format to emit when --emit-binary is used (default: rgb565).",
+    )
+    parser.add_argument(
+        "--endian",
+        choices=("little", "big"),
+        default="little",
+        help="Endianness for multi-byte pixel formats (default: little).",
+    )
+    parser.add_argument(
+        "--dither",
+        choices=("none", "floyd", "ordered"),
+        default="none",
+        help="Dithering mode for rgb332 and mono1 conversions (default: none).",
+    )
+    parser.add_argument(
+        "--pack-order",
+        choices=("row-major",),
+        default="row-major",
+        help="Frame buffer scanning order (reserved for future use).",
+    )
+    parser.add_argument(
+        "--bin-onefile",
+        action="store_true",
+        help="Emit a single frames.bin file plus metadata instead of per-frame binaries.",
+    )
+    parser.add_argument(
+        "--emit-legacy-frames-file",
+        action="store_true",
+        help="Also write the legacy frames.txt delays file alongside timing.txt.",
+    )
     return parser
 
 
@@ -232,7 +503,9 @@ def process_media(
     color_depth: int,
     fps: int,
     cleanup_temp: bool,
-) -> tuple[int, int, int, int]:
+    binary_options: BinaryOptions,
+    legacy_frames: bool,
+) -> Tuple[int, int, int, int]:
     """Process all media found in the input directories."""
     ensure_directories()
 
@@ -254,12 +527,13 @@ def process_media(
 
     converted_gifs = 0
     for gif_path in gifs:
-        if save_frames_from_gif(gif_path, OUTPUT_PATH, output_size, color_depth):
+        print(f"Processing {gif_path.name}...")
+        if save_frames_from_gif(gif_path, OUTPUT_PATH, output_size, color_depth, binary_options, legacy_frames):
             converted_gifs += 1
 
     converted_videos = 0
     for mp4_path in videos:
-        if process_mp4(mp4_path, OUTPUT_PATH, output_size, color_depth, fps, cleanup_temp):
+        if process_mp4(mp4_path, OUTPUT_PATH, output_size, color_depth, fps, cleanup_temp, binary_options, legacy_frames):
             converted_videos += 1
 
     print(
@@ -275,28 +549,54 @@ def clean_temp_directory() -> None:
     shutil.rmtree(TEMP_GIF_PATH, ignore_errors=True)
 
 
-def validate_test_output(frames_dir: Path) -> tuple[bool, int]:
-    """Check that the expected frame outputs exist and return success and frame count."""
-    frame_file = frames_dir / "frame_0001.bmp"
-    frames_txt = frames_dir / "frames.txt"
+def validate_binary_output(frames_dir: Path, binary_options: BinaryOptions) -> None:
+    """Validate binary framebuffer output for tests."""
+    bin_dir = frames_dir / (binary_options.bin_subdir.strip() or "bin")
+    if not bin_dir.exists():
+        raise AssertionError(f"Binary output missing at {bin_dir}")
 
-    if not frames_dir.exists():
-        print("Test case failed: output folder was not created.")
-        return False, 0
-    if not frame_file.exists():
-        print("Test case failed: first frame file is missing.")
-        return False, 0
-    if not frames_txt.exists():
-        print("Test case failed: frames.txt not generated.")
-        return False, 0
+    metadata_path = bin_dir / "metadata.json"
+    if not metadata_path.exists():
+        raise AssertionError("metadata.json missing from binary output")
 
-    delays = [line for line in frames_txt.read_text(encoding="utf-8").splitlines() if line.strip()]
-    if not delays:
-        print("Test case failed: frames.txt does not contain delay entries.")
-        return False, 0
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    frame_count = metadata.get("frame_count", 0)
+    delays = metadata.get("delays_ms", [])
+    if frame_count <= 0:
+        raise AssertionError("metadata.json reports zero frames")
+    if len(delays) != frame_count:
+        raise AssertionError("delays_ms length does not match frame_count")
+    if metadata.get("pixel_format") != binary_options.pixel_format:
+        raise AssertionError("Pixel format in metadata does not match expected value")
+    if metadata.get("endian") != binary_options.endian:
+        raise AssertionError("Endian in metadata does not match expected value")
 
-    frame_count = len(list(frames_dir.glob("frame_*.bmp")))
-    return True, frame_count
+    width = metadata.get("width")
+    height = metadata.get("height")
+    expected_length = bytes_per_frame(width, height, binary_options.pixel_format)
+
+    filenames = metadata.get("filenames", [])
+    frames_bin = bin_dir / "frames.bin"
+    if binary_options.single_file:
+        if not frames_bin.exists():
+            raise AssertionError("frames.bin missing despite --bin-onefile")
+        if frames_bin.stat().st_size != expected_length * frame_count:
+            raise AssertionError("frames.bin size does not match expected total length")
+        offsets = metadata.get("frame_offsets", [])
+        frame_len = metadata.get("frame_length_bytes")
+        if len(offsets) != frame_count:
+            raise AssertionError("frame_offsets length does not match frame_count")
+        if frame_len != expected_length:
+            raise AssertionError("frame_length_bytes incorrect in metadata")
+    else:
+        if len(filenames) != frame_count:
+            raise AssertionError("Number of binary frame files does not match frame_count")
+        for name in filenames:
+            bin_path = bin_dir / name
+            if not bin_path.exists():
+                raise AssertionError(f"Frame binary missing: {name}")
+            if bin_path.stat().st_size != expected_length:
+                raise AssertionError(f"Unexpected frame size in {name}")
 
 
 def run_gif_test(
@@ -304,6 +604,8 @@ def run_gif_test(
     color_depth: int,
     fps: int,
     no_cleanup: bool,
+    binary_options: BinaryOptions,
+    legacy_frames: bool,
 ) -> None:
     test_gif = Path(TEST_GIF_NAME)
     if not test_gif.exists():
@@ -314,21 +616,53 @@ def run_gif_test(
     ensure_directories()
 
     frames_dir = OUTPUT_PATH / test_gif.stem
-    preexisting_frames = frames_dir.exists()
+    if frames_dir.exists() and not no_cleanup:
+        shutil.rmtree(frames_dir, ignore_errors=True)
 
     destination = INPUT_GIF_PATH / test_gif.name
     preexisting_input = destination.exists()
     shutil.copy2(test_gif, destination)
 
     cleanup_temp = not no_cleanup
-    process_media(output_size, color_depth, fps, cleanup_temp)
+    process_media(output_size, color_depth, fps, cleanup_temp, binary_options, legacy_frames)
 
-    success, frame_count = validate_test_output(frames_dir)
-    if success:
-        print(f"Test case passed: {TEST_GIF_NAME} converted successfully with {frame_count} frame(s).")
+    frame_file = frames_dir / "frame_0001.bmp"
+    timing_file = frames_dir / "timing.txt"
+
+    if not frames_dir.exists():
+        print("Test case failed: output folder was not created.")
+    elif not frame_file.exists():
+        print("Test case failed: first frame file is missing.")
+    elif not timing_file.exists():
+        print("Test case failed: timing.txt not generated.")
+    else:
+        timing_lines = [line for line in timing_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+        frame_count = len(list(frames_dir.glob("frame_*.bmp")))
+        if len(timing_lines) != frame_count:
+            print("Test case failed: timing.txt line count does not match frame count.")
+        elif not all(TIMING_LINE_PATTERN.match(line) for line in timing_lines):
+            print("Test case failed: timing.txt contains malformed lines.")
+        else:
+            success = True
+            if legacy_frames:
+                frames_txt = frames_dir / "frames.txt"
+                if not frames_txt.exists():
+                    print("Test case failed: legacy frames.txt requested but missing.")
+                    success = False
+                else:
+                    legacy_lines = [line for line in frames_txt.read_text(encoding="utf-8").splitlines() if line.strip()]
+                    if len(legacy_lines) != frame_count:
+                        print("Test case failed: frames.txt entries do not match frame count.")
+                        success = False
+            if success:
+                if binary_options.enabled:
+                    validate_binary_output(frames_dir, binary_options)
+                print(
+                    f"Test case passed: {TEST_GIF_NAME} converted successfully with {frame_count} frame(s)."
+                )
 
     if not no_cleanup:
-        if not preexisting_frames and frames_dir.exists():
+        if frames_dir.exists():
             shutil.rmtree(frames_dir, ignore_errors=True)
         if not preexisting_input and destination.exists():
             destination.unlink()
@@ -339,6 +673,8 @@ def run_mp4_test(
     color_depth: int,
     fps: int,
     no_cleanup: bool,
+    binary_options: BinaryOptions,
+    legacy_frames: bool,
 ) -> None:
     test_mp4 = Path(TEST_MP4_NAME)
     if not test_mp4.exists():
@@ -349,21 +685,53 @@ def run_mp4_test(
     ensure_directories()
 
     frames_dir = OUTPUT_PATH / Path(TEST_MP4_NAME).stem
-    preexisting_frames = frames_dir.exists()
+    if frames_dir.exists() and not no_cleanup:
+        shutil.rmtree(frames_dir, ignore_errors=True)
 
     destination = INPUT_MP4_PATH / test_mp4.name
     preexisting_input = destination.exists()
     shutil.copy2(test_mp4, destination)
 
     cleanup_temp = not no_cleanup
-    process_media(output_size, color_depth, fps, cleanup_temp)
+    process_media(output_size, color_depth, fps, cleanup_temp, binary_options, legacy_frames)
 
-    success, frame_count = validate_test_output(frames_dir)
-    if success:
-        print(f"MP4 test case passed: {TEST_MP4_NAME} converted successfully with {frame_count} frame(s).")
+    frame_file = frames_dir / "frame_0001.bmp"
+    timing_file = frames_dir / "timing.txt"
+
+    if not frames_dir.exists():
+        print("MP4 test case failed: output folder was not created.")
+    elif not frame_file.exists():
+        print("MP4 test case failed: first frame file is missing.")
+    elif not timing_file.exists():
+        print("MP4 test case failed: timing.txt not generated.")
+    else:
+        timing_lines = [line for line in timing_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+        frame_count = len(list(frames_dir.glob("frame_*.bmp")))
+        if len(timing_lines) != frame_count:
+            print("MP4 test case failed: timing.txt line count does not match frame count.")
+        elif not all(TIMING_LINE_PATTERN.match(line) for line in timing_lines):
+            print("MP4 test case failed: timing.txt contains malformed lines.")
+        else:
+            success = True
+            if legacy_frames:
+                frames_txt = frames_dir / "frames.txt"
+                if not frames_txt.exists():
+                    print("MP4 test case failed: legacy frames.txt requested but missing.")
+                    success = False
+                else:
+                    legacy_lines = [line for line in frames_txt.read_text(encoding="utf-8").splitlines() if line.strip()]
+                    if len(legacy_lines) != frame_count:
+                        print("MP4 test case failed: frames.txt entries do not match frame count.")
+                        success = False
+            if success:
+                if binary_options.enabled:
+                    validate_binary_output(frames_dir, binary_options)
+                print(
+                    f"MP4 test case passed: {TEST_MP4_NAME} converted successfully with {frame_count} frame(s)."
+                )
 
     if not no_cleanup:
-        if not preexisting_frames and frames_dir.exists():
+        if frames_dir.exists():
             shutil.rmtree(frames_dir, ignore_errors=True)
         if not preexisting_input and destination.exists():
             destination.unlink()
@@ -374,12 +742,16 @@ def run_built_in_tests(
     color_depth: int,
     fps: int,
     no_cleanup: bool,
+    binary_options: BinaryOptions,
+    legacy_frames: bool,
 ) -> None:
-    run_gif_test(output_size, color_depth, fps, no_cleanup)
-    run_mp4_test(output_size, color_depth, fps, no_cleanup)
+    run_gif_test(output_size, color_depth, fps, no_cleanup, binary_options, legacy_frames)
+    run_mp4_test(output_size, color_depth, fps, no_cleanup, binary_options, legacy_frames)
 
-    if not no_cleanup:
-        clean_temp_directory()
+    if binary_options.enabled:
+        mono_options = binary_options.with_overrides(pixel_format="mono1", dither="ordered", bin_subdir="bin_mono1")
+        run_gif_test(output_size, color_depth, fps, no_cleanup, mono_options, legacy_frames)
+        print("Binary pipeline test passed: mono1 format validated.")
 
 
 def main() -> int:
@@ -393,10 +765,23 @@ def main() -> int:
     fps = max(1, GIF_FPS)
 
     cleanup_temp = not args.no_cleanup
+    legacy_frames = args.emit_legacy_frames_file
 
-    process_media(output_size, color_depth, fps, cleanup_temp)
+    binary_options = BinaryOptions(
+        enabled=args.emit_binary,
+        pixel_format=args.binary_format,
+        endian=args.endian,
+        dither=args.dither,
+        pack_order=args.pack_order,
+        single_file=args.bin_onefile,
+    )
 
-    run_built_in_tests(output_size, color_depth, fps, args.no_cleanup)
+    process_media(output_size, color_depth, fps, cleanup_temp, binary_options, legacy_frames)
+
+    if cleanup_temp:
+        clean_temp_directory()
+
+    run_built_in_tests(output_size, color_depth, fps, args.no_cleanup, binary_options, legacy_frames)
 
     return 0
 
